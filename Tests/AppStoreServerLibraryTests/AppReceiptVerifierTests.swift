@@ -15,6 +15,10 @@ final class AppReceiptVerifierTests: XCTestCase {
     private static let SHA1_HASH: [UInt8] = [
         0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18,
         0x29, 0x3a, 0x4b, 0x5c, 0x6d, 0x7e, 0x8f, 0x90, 0x11, 0x22, 0x33, 0x44]
+    ///The DER encoding of the PKCS#7 signedData content type OID, 1.2.840.113549.1.7.2
+    private static let SIGNED_DATA_OID: [UInt8] = [0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02]
+    ///An OID this library does not implement as a receipt digest algorithm, 2.16.840.1.101.3.4.2.3
+    private static let SHA512_OID: ASN1ObjectIdentifier = [2, 16, 840, 1, 101, 3, 4, 2, 3]
     private static let UNKNOWN_RECEIPT_ATTRIBUTE_VALUE: [UInt8] = [0x0d, 0x0e, 0x0a, 0x0d]
     private static let UNKNOWN_IN_APP_ATTRIBUTE_VALUE: [UInt8] = [0x0b, 0x0e, 0x0e, 0x0f]
 
@@ -38,6 +42,10 @@ final class AppReceiptVerifierTests: XCTestCase {
     private static let SUBSCRIPTION_EXPIRES_DATE_VALUE = Date(timeIntervalSince1970: 1896168600)
     private static let SUBSCRIPTION_CANCELLATION_DATE = "2024-06-01T00:00:00Z"
     private static let SUBSCRIPTION_CANCELLATION_DATE_VALUE = Date(timeIntervalSince1970: 1717200000)
+
+    ///A responder URI this library's OCSP requester cannot make a request to, so a query fails as a network error
+    ///immediately rather than waiting on a connection that will never be made.
+    private static let UNUSABLE_OCSP_RESPONDER = "ocsp://responder.invalid"
 
     private static let receiptCreator = try! ReceiptCreator.createReceiptCreator()
     private static let sandboxReceipt = try! receiptCreator.signReceipt(receiptPayload("ProductionSandbox", BUNDLE_ID, RECEIPT_CREATION_DATE))
@@ -119,6 +127,22 @@ final class AppReceiptVerifierTests: XCTestCase {
         let unknownTypeReceipt = try AppReceiptVerifierTests.receiptCreator.signReceipt(AppReceiptVerifierTests.receiptPayload("ProductionInternal", AppReceiptVerifierTests.BUNDLE_ID, AppReceiptVerifierTests.RECEIPT_CREATION_DATE))
         let verifier = AppReceiptVerifierTests.verifier(environment: .sandbox)
         await assertInvalid(.INVALID_ENVIRONMENT, await verifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(unknownTypeReceipt)))
+
+        let productionVerifier = AppReceiptVerifierTests.verifier(environment: .production)
+        await assertInvalid(.INVALID_ENVIRONMENT, await productionVerifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(unknownTypeReceipt)))
+    }
+
+    ///Every receipt type the App Store issues maps to the environment that produced it, a Volume Purchase Program
+    ///receipt included.
+    public func testReceiptTypeEnvironmentMapping() async throws {
+        let types: [(String, AppStoreEnvironment)] = [
+            ("Production", .production), ("ProductionVPP", .production),
+            ("ProductionSandbox", .sandbox), ("ProductionVPPSandbox", .sandbox)]
+        for (receiptType, environment) in types {
+            let receipt = try AppReceiptVerifierTests.receiptCreator.signReceipt(AppReceiptVerifierTests.receiptPayload(receiptType, AppReceiptVerifierTests.BUNDLE_ID, AppReceiptVerifierTests.RECEIPT_CREATION_DATE))
+            let decoded = try await validReceipt(AppReceiptVerifierTests.verifier(environment: environment).verifyAndDecodeAppReceipt(encodedReceipt: encode(receipt)))
+            XCTAssertEqual(receiptType, decoded.receiptType)
+        }
     }
 
     public func testTamperedPayload() async throws {
@@ -253,6 +277,277 @@ final class AppReceiptVerifierTests: XCTestCase {
         await assertInvalid(.VERIFICATION_FAILURE, await verifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(receipt)))
     }
 
+    ///The limit is on how many certificates are embedded, not on how many a chain needs, so a receipt carrying as
+    ///many as the limit allows still verifies and the one beyond it does not.
+    public func testReceiptWithTheMaximumEmbeddedCertificates() async throws {
+        let verifier = AppReceiptVerifierTests.verifier(environment: .sandbox)
+
+        let atTheLimit = try AppReceiptVerifierTests.receiptCreator.signReceipt(AppReceiptVerifierTests.receiptPayload("ProductionSandbox", AppReceiptVerifierTests.BUNDLE_ID, AppReceiptVerifierTests.RECEIPT_CREATION_DATE), paddingCertificates: 7)
+        let decoded = try await validReceipt(verifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(atTheLimit)))
+        XCTAssertEqual(AppReceiptVerifierTests.BUNDLE_ID, decoded.bundleId)
+
+        let overTheLimit = try AppReceiptVerifierTests.receiptCreator.signReceipt(AppReceiptVerifierTests.receiptPayload("ProductionSandbox", AppReceiptVerifierTests.BUNDLE_ID, AppReceiptVerifierTests.RECEIPT_CREATION_DATE), paddingCertificates: 8)
+        await assertInvalid(.VERIFICATION_FAILURE, await verifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(overTheLimit)))
+    }
+
+    ///A chain is exactly leaf, intermediate and root, so a receipt whose embedded certificates go on chaining past
+    ///the root is rejected rather than verified on the first three of them.
+    public func testChainAssemblingPastTheExpectedLength() async throws {
+        let receipt = try AppReceiptVerifierTests.receiptCreator.signReceipt(AppReceiptVerifierTests.receiptPayload("ProductionSandbox", AppReceiptVerifierTests.BUNDLE_ID, AppReceiptVerifierTests.RECEIPT_CREATION_DATE), paddingCertificates: 1, paddingSubject: ReceiptCreator.ROOT_NAME)
+
+        let verifier = AppReceiptVerifierTests.verifier(environment: .sandbox)
+        await assertInvalid(.VERIFICATION_FAILURE, await verifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(receipt)))
+    }
+
+    ///The chain is assembled from the certificate the signer info identifies, not from whichever certificate the
+    ///container happens to carry first.
+    public func testSignerCertificateIsTheOneTheSignerInfoIdentifies() async throws {
+        let receipt = try AppReceiptVerifierTests.receiptCreator.signReceipt(AppReceiptVerifierTests.receiptPayload("ProductionSandbox", AppReceiptVerifierTests.BUNDLE_ID, AppReceiptVerifierTests.RECEIPT_CREATION_DATE), paddingCertificates: 1, paddingSubject: "Test Unrelated CA", paddingBeforeChain: true)
+
+        let decoded = try await validReceipt(AppReceiptVerifierTests.verifier(environment: .sandbox).verifyAndDecodeAppReceipt(encodedReceipt: encode(receipt)))
+        XCTAssertEqual(AppReceiptVerifierTests.BUNDLE_ID, decoded.bundleId)
+    }
+
+    ///The chain, the payload and the message digest can all be intact while the signature is not: a receipt signed
+    ///by a key that is not the leaf certificate's is caught by the signature check alone.
+    public func testReceiptSignedByAnotherKey() async throws {
+        let receipt = try AppReceiptVerifierTests.receiptCreator.signReceipt(AppReceiptVerifierTests.receiptPayload("ProductionSandbox", AppReceiptVerifierTests.BUNDLE_ID, AppReceiptVerifierTests.RECEIPT_CREATION_DATE), signedByAnotherKey: true)
+
+        let verifier = AppReceiptVerifierTests.verifier(environment: .sandbox)
+        await assertInvalid(.VERIFICATION_FAILURE, await verifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(receipt)))
+    }
+
+    ///Signed attributes bind the payload to the signature only through the message digest attribute, so attributes
+    ///carrying no digest at all leave the payload unsigned and must be rejected.
+    public func testReceiptWithSignedAttributesButNoMessageDigest() async throws {
+        let receipt = try AppReceiptVerifierTests.receiptCreator.signReceipt(AppReceiptVerifierTests.receiptPayload("ProductionSandbox", AppReceiptVerifierTests.BUNDLE_ID, AppReceiptVerifierTests.RECEIPT_CREATION_DATE), messageDigest: false)
+
+        let verifier = AppReceiptVerifierTests.verifier(environment: .sandbox)
+        await assertInvalid(.VERIFICATION_FAILURE, await verifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(receipt)))
+    }
+
+    ///A signed attribute this library does not model must not be mistaken for the message digest attribute it does.
+    public func testReceiptWithUnknownSignedAttribute() async throws {
+        let receipt = try AppReceiptVerifierTests.receiptCreator.signReceipt(AppReceiptVerifierTests.receiptPayload("ProductionSandbox", AppReceiptVerifierTests.BUNDLE_ID, AppReceiptVerifierTests.RECEIPT_CREATION_DATE), unknownSignedAttribute: true)
+
+        let decoded = try await validReceipt(AppReceiptVerifierTests.verifier(environment: .sandbox).verifyAndDecodeAppReceipt(encodedReceipt: encode(receipt)))
+        XCTAssertEqual(AppReceiptVerifierTests.BUNDLE_ID, decoded.bundleId)
+    }
+
+    ///Legacy App Store receipts are SHA-1 signed, so the SHA-1 digest algorithm has to select both the digest the
+    ///message digest attribute is compared against and the RSA signature algorithm.
+    public func testSha1SignedReceipt() async throws {
+        let payload = AppReceiptVerifierTests.receiptPayload("ProductionSandbox", AppReceiptVerifierTests.BUNDLE_ID, AppReceiptVerifierTests.RECEIPT_CREATION_DATE)
+        let verifier = AppReceiptVerifierTests.verifier(environment: .sandbox)
+
+        let withSignedAttributes = try AppReceiptVerifierTests.receiptCreator.signReceipt(payload, digestAlgorithm: ReceiptCreator.SHA1_OID)
+        let decodedWithSignedAttributes = try await validReceipt(verifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(withSignedAttributes)))
+        XCTAssertEqual(AppReceiptVerifierTests.BUNDLE_ID, decodedWithSignedAttributes.bundleId)
+
+        // The shape a genuine App Store receipt arrives in: SHA-1 over the payload, with no signed attributes
+        let overThePayload = try AppReceiptVerifierTests.receiptCreator.signReceipt(payload, signedAttributes: false, digestAlgorithm: ReceiptCreator.SHA1_OID)
+        let decodedOverThePayload = try await validReceipt(verifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(overThePayload)))
+        XCTAssertEqual(AppReceiptVerifierTests.BUNDLE_ID, decodedOverThePayload.bundleId)
+    }
+
+    ///A digest algorithm this library does not implement must fail verification rather than fall back to one it does.
+    public func testReceiptWithUnsupportedDigestAlgorithm() async throws {
+        let receipt = try AppReceiptVerifierTests.receiptCreator.signReceipt(AppReceiptVerifierTests.receiptPayload("ProductionSandbox", AppReceiptVerifierTests.BUNDLE_ID, AppReceiptVerifierTests.RECEIPT_CREATION_DATE), digestAlgorithm: AppReceiptVerifierTests.SHA512_OID)
+
+        let verifier = AppReceiptVerifierTests.verifier(environment: .sandbox)
+        await assertInvalid(.VERIFICATION_FAILURE, await verifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(receipt)))
+    }
+
+    ///Nothing identifies the signer when the certificate its signer info names is not in the container, which is a
+    ///certificate problem rather than a generic verification failure.
+    public func testReceiptWithoutTheSignerCertificate() async throws {
+        let receipt = try AppReceiptVerifierTests.receiptCreator.signReceipt(AppReceiptVerifierTests.receiptPayload("ProductionSandbox", AppReceiptVerifierTests.BUNDLE_ID, AppReceiptVerifierTests.RECEIPT_CREATION_DATE), embeddedCertificates: 0)
+
+        let verifier = AppReceiptVerifierTests.verifier(environment: .sandbox)
+        await assertInvalid(.INVALID_CERTIFICATE, await verifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(receipt)))
+    }
+
+    ///The embedded certificates are attacker-supplied, so one that does not decode fails the receipt rather than
+    ///being skipped over on the way to a chain assembled from the rest.
+    public func testReceiptWithMalformedCertificate() async throws {
+        let receipt = try AppReceiptVerifierTests.receiptCreator.signReceipt(AppReceiptVerifierTests.receiptPayload("ProductionSandbox", AppReceiptVerifierTests.BUNDLE_ID, AppReceiptVerifierTests.RECEIPT_CREATION_DATE), malformedCertificate: true)
+
+        let verifier = AppReceiptVerifierTests.verifier(environment: .sandbox)
+        await assertInvalid(.INVALID_CERTIFICATE, await verifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(receipt)))
+    }
+
+    ///Every structure the container walk indexes into is attacker-controlled, so one with an element missing has to
+    ///fail verification. Reading past the end of any of them would trap instead, taking the process with it.
+    public func testTruncatedContainersAreRejected() async throws {
+        let verifier = AppReceiptVerifierTests.verifier(environment: .sandbox)
+
+        for (missingElement, container) in ReceiptCreator.truncatedContainers() {
+            switch await verifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(container)) {
+            case .valid(_):
+                XCTFail("Expected a \(missingElement) to be rejected")
+            case .invalid(let error):
+                XCTAssertEqual(VerificationError.VERIFICATION_FAILURE, error, "a \(missingElement)")
+            }
+        }
+    }
+
+    ///The outer container must be a PKCS#7 signedData; another content type is not a receipt even when the bytes
+    ///inside it parse as one.
+    public func testReceiptThatIsNotSignedDataContentType() async throws {
+        var receipt = AppReceiptVerifierTests.sandboxReceipt
+        // Retag the content type as 1.2.840.113549.1.7.1 (data); it sits outside everything the signature covers
+        receipt[try indexOf(receipt, AppReceiptVerifierTests.SIGNED_DATA_OID) + AppReceiptVerifierTests.SIGNED_DATA_OID.count - 1] = 0x01
+
+        let verifier = AppReceiptVerifierTests.verifier(environment: .sandbox)
+        await assertInvalid(.VERIFICATION_FAILURE, await verifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(receipt)))
+    }
+
+    ///The payload is a SET of attributes; a payload of any other shape is not a receipt and must not be walked as
+    ///though it were.
+    public func testPayloadThatIsNotAnAttributeSet() async throws {
+        var payload = AppReceiptVerifierTests.receiptPayload("ProductionSandbox", AppReceiptVerifierTests.BUNDLE_ID, AppReceiptVerifierTests.RECEIPT_CREATION_DATE)
+        // Retag the attribute SET as a SEQUENCE, leaving its contents untouched
+        payload[0] = 0x30
+        let receipt = try AppReceiptVerifierTests.receiptCreator.signReceipt(payload)
+
+        let verifier = AppReceiptVerifierTests.verifier(environment: .sandbox)
+        await assertInvalid(.VERIFICATION_FAILURE, await verifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(receipt)))
+    }
+
+    ///Base64 receipts pick up line breaks in transit, which the decoder ignores rather than rejecting the receipt.
+    public func testReceiptWithLineBreaksInBase64() async throws {
+        let encoded = AppReceiptVerifierTests.sandboxReceipt.base64EncodedString(options: [.lineLength64Characters, .endLineWithLineFeed])
+
+        let decoded = try await validReceipt(AppReceiptVerifierTests.verifier(environment: .sandbox).verifyAndDecodeAppReceipt(encodedReceipt: encoded))
+        XCTAssertEqual(AppReceiptVerifierTests.BUNDLE_ID, decoded.bundleId)
+    }
+
+    ///A receipt with no creation date has no signing time to anchor the chain to, so the chain is evaluated at the
+    ///current time instead of the receipt failing.
+    public func testReceiptWithoutCreationDate() async throws {
+        let receipt = try AppReceiptVerifierTests.receiptCreator.signReceipt(ReceiptCreator.attributeSet()
+            .string(0, "ProductionSandbox")
+            .string(2, AppReceiptVerifierTests.BUNDLE_ID)
+            .build())
+
+        let decoded = try await validReceipt(AppReceiptVerifierTests.verifier(environment: .sandbox).verifyAndDecodeAppReceipt(encodedReceipt: encode(receipt)))
+        XCTAssertNil(decoded.receiptCreationDate)
+    }
+
+    ///Apple is not consistent about which ASN.1 string type a receipt attribute uses, so a PrintableString decodes
+    ///like the UTF8Strings and IA5Strings the other attributes arrive as.
+    public func testPrintableStringAttribute() async throws {
+        let receipt = try AppReceiptVerifierTests.receiptCreator.signReceipt(ReceiptCreator.attributeSet()
+            .printableString(0, "ProductionSandbox")
+            .printableString(2, AppReceiptVerifierTests.BUNDLE_ID)
+            .date(12, AppReceiptVerifierTests.RECEIPT_CREATION_DATE)
+            .build())
+
+        let decoded = try await validReceipt(AppReceiptVerifierTests.verifier(environment: .sandbox).verifyAndDecodeAppReceipt(encodedReceipt: encode(receipt)))
+        XCTAssertEqual("ProductionSandbox", decoded.receiptType)
+        XCTAssertEqual(AppReceiptVerifierTests.BUNDLE_ID, decoded.bundleId)
+    }
+
+    ///An attribute carrying more than the three elements this library reads is decoded from the three it knows, so
+    ///a field Apple adds inside an attribute does not fail the whole receipt.
+    public func testAttributeWithAnAdditionalElement() async throws {
+        let receipt = try AppReceiptVerifierTests.receiptCreator.signReceipt(ReceiptCreator.attributeSet()
+            .string(0, "ProductionSandbox")
+            .rawWithExtraElement(2, Array(derEncodedUTF8String(AppReceiptVerifierTests.BUNDLE_ID)))
+            .date(12, AppReceiptVerifierTests.RECEIPT_CREATION_DATE)
+            .build())
+
+        let decoded = try await validReceipt(AppReceiptVerifierTests.verifier(environment: .sandbox).verifyAndDecodeAppReceipt(encodedReceipt: encode(receipt)))
+        XCTAssertEqual(AppReceiptVerifierTests.BUNDLE_ID, decoded.bundleId)
+    }
+
+    ///An attribute value that is not a string at all, or is a string type carrying bytes that are not UTF-8, is a
+    ///malformed receipt rather than a field that silently decodes to something else.
+    public func testAttributeValueThatIsNotAString() async throws {
+        let verifier = AppReceiptVerifierTests.verifier(environment: .sandbox)
+
+        let integerBundleId = try AppReceiptVerifierTests.receiptCreator.signReceipt(ReceiptCreator.attributeSet()
+            .string(0, "ProductionSandbox")
+            .integer(2, 5)
+            .date(12, AppReceiptVerifierTests.RECEIPT_CREATION_DATE)
+            .build())
+        await assertInvalid(.VERIFICATION_FAILURE, await verifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(integerBundleId)))
+
+        // A UTF8String whose contents are not valid UTF-8
+        let invalidUtf8BundleId = try AppReceiptVerifierTests.receiptCreator.signReceipt(ReceiptCreator.attributeSet()
+            .string(0, "ProductionSandbox")
+            .raw(2, [0x0c, 0x02, 0xff, 0xfe])
+            .date(12, AppReceiptVerifierTests.RECEIPT_CREATION_DATE)
+            .build())
+        await assertInvalid(.VERIFICATION_FAILURE, await verifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(invalidUtf8BundleId)))
+    }
+
+    ///Receipt integers are non-negative, so a negative one is a malformed receipt rather than a value to carry
+    ///through to the caller.
+    public func testNegativeInAppPurchaseInteger() async throws {
+        let receipt = try AppReceiptVerifierTests.receiptCreator.signReceipt(ReceiptCreator.attributeSet()
+            .string(0, "ProductionSandbox")
+            .string(2, AppReceiptVerifierTests.BUNDLE_ID)
+            .date(12, AppReceiptVerifierTests.RECEIPT_CREATION_DATE)
+            .raw(17, ReceiptCreator.attributeSet().integer(1701, -1).build())
+            .build())
+
+        let verifier = AppReceiptVerifierTests.verifier(environment: .sandbox)
+        await assertInvalid(.VERIFICATION_FAILURE, await verifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(receipt)))
+    }
+
+    ///A date attribute that is neither empty nor an RFC 3339 date fails the receipt, rather than decoding as the
+    ///absent date an empty one means.
+    public func testUnparseableReceiptDate() async throws {
+        let receipt = try AppReceiptVerifierTests.receiptCreator.signReceipt(ReceiptCreator.attributeSet()
+            .string(0, "ProductionSandbox")
+            .string(2, AppReceiptVerifierTests.BUNDLE_ID)
+            .date(12, "March 1st, 2024")
+            .build())
+
+        let verifier = AppReceiptVerifierTests.verifier(environment: .sandbox)
+        await assertInvalid(.VERIFICATION_FAILURE, await verifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(receipt)))
+    }
+
+    ///Receipt dates carry fractional seconds as well as whole ones.
+    public func testDateWithFractionalSeconds() async throws {
+        let receipt = try AppReceiptVerifierTests.receiptCreator.signReceipt(ReceiptCreator.attributeSet()
+            .string(0, "ProductionSandbox")
+            .string(2, AppReceiptVerifierTests.BUNDLE_ID)
+            .date(12, "2024-03-01T12:00:00.500Z")
+            .build())
+
+        let decoded = try await validReceipt(AppReceiptVerifierTests.verifier(environment: .sandbox).verifyAndDecodeAppReceipt(encodedReceipt: encode(receipt)))
+        XCTAssertEqual(Date(timeIntervalSince1970: 1709294400.5), decoded.receiptCreationDate)
+    }
+
+    ///Which id an in-app purchase yields is deterministic: its transaction id, and only when it carries none, its
+    ///original transaction id.
+    public func testTransactionIdPreferredOverOriginalTransactionId() async throws {
+        let verifier = AppReceiptVerifierTests.verifier(environment: .sandbox)
+
+        let bothIds = try AppReceiptVerifierTests.receiptCreator.signReceipt(AppReceiptVerifierTests.receiptWithPurchase(ReceiptCreator.attributeSet()
+            .string(1703, "70000000000003")
+            .string(1705, "70000000000004")
+            .build()))
+        switch await verifier.verifyAndExtractTransactionId(encodedReceipt: encode(bothIds)) {
+        case .valid(let transactionId):
+            XCTAssertEqual("70000000000003", transactionId)
+        case .invalid(let error):
+            XCTFail("Expected a valid receipt, got \(error)")
+        }
+
+        let originalIdOnly = try AppReceiptVerifierTests.receiptCreator.signReceipt(AppReceiptVerifierTests.receiptWithPurchase(ReceiptCreator.attributeSet()
+            .string(1705, "70000000000004")
+            .build()))
+        switch await verifier.verifyAndExtractTransactionId(encodedReceipt: encode(originalIdOnly)) {
+        case .valid(let transactionId):
+            XCTAssertEqual("70000000000004", transactionId)
+        case .invalid(let error):
+            XCTFail("Expected a valid receipt, got \(error)")
+        }
+    }
+
     ///A receipt Xcode actually produced, which unlike the synthetic ones above is BER with indefinite lengths,
     ///segmented octet strings and a double-wrapped payload.
     public func testXcodeGeneratedAppReceiptDecoding() async throws {
@@ -344,6 +639,51 @@ final class AppReceiptVerifierTests: XCTestCase {
         }
     }
 
+    ///Revocation checking is the other half of what enabling online checks buys, and it is only reachable through
+    ///the chain verifier: a receipt whose leaf names an OCSP responder must be queried when they are on, so a
+    ///responder that cannot be reached fails it as retryable, and must not be queried at all when they are off.
+    public func testOnlineChecksQueryTheOcspResponder() async throws {
+        let creator = try ReceiptCreator.createReceiptCreator(ocspResponderUri: AppReceiptVerifierTests.UNUSABLE_OCSP_RESPONDER)
+        let receipt = try creator.signReceipt(AppReceiptVerifierTests.receiptPayload("ProductionSandbox", AppReceiptVerifierTests.BUNDLE_ID, AppReceiptVerifierTests.RECEIPT_CREATION_DATE))
+
+        let decoded = try await validReceipt(AppReceiptVerifierTests.verifier(creator, environment: .sandbox).verifyAndDecodeAppReceipt(encodedReceipt: encode(receipt)))
+        XCTAssertEqual(AppReceiptVerifierTests.BUNDLE_ID, decoded.bundleId)
+
+        let onlineVerifier = AppReceiptVerifierTests.verifier(creator, environment: .sandbox, enableOnlineChecks: true)
+        await assertInvalid(.RETRYABLE_VERIFICATION_FAILURE, await onlineVerifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(receipt)))
+    }
+
+    ///The certificates are optional in CMS, so a container without them is well formed; it just carries nothing to
+    ///identify the signer with, which is a certificate problem rather than a malformed container.
+    public func testContainerWithoutACertificatesField() async throws {
+        let receipt = try AppReceiptVerifierTests.receiptCreator.signReceipt(AppReceiptVerifierTests.receiptPayload("ProductionSandbox", AppReceiptVerifierTests.BUNDLE_ID, AppReceiptVerifierTests.RECEIPT_CREATION_DATE), omitCertificates: true)
+
+        let verifier = AppReceiptVerifierTests.verifier(environment: .sandbox)
+        await assertInvalid(.INVALID_CERTIFICATE, await verifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(receipt)))
+    }
+
+    ///An EXPLICIT tag wraps exactly one node: an empty wrapper carries no payload at all, and one carrying a second
+    ///payload must be rejected rather than verified on the first, which would leave the second unsigned.
+    public func testContentWrapperHoldingOtherThanOnePayload() async throws {
+        let payload = AppReceiptVerifierTests.receiptPayload("ProductionSandbox", AppReceiptVerifierTests.BUNDLE_ID, AppReceiptVerifierTests.RECEIPT_CREATION_DATE)
+        let verifier = AppReceiptVerifierTests.verifier(environment: .sandbox)
+
+        let empty = try AppReceiptVerifierTests.receiptCreator.signReceipt(payload, encapsulatedPayloads: 0)
+        await assertInvalid(.VERIFICATION_FAILURE, await verifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(empty)))
+
+        let twoPayloads = try AppReceiptVerifierTests.receiptCreator.signReceipt(payload, encapsulatedPayloads: 2)
+        await assertInvalid(.VERIFICATION_FAILURE, await verifier.verifyAndDecodeAppReceipt(encodedReceipt: encode(twoPayloads)))
+    }
+
+    ///RFC 5754 lets a SHA-2 producer leave the parameters out of an algorithm identifier, so an identifier carrying
+    ///only its OID names the digest algorithm just as one carrying a DER NULL does.
+    public func testDigestAlgorithmWithoutParameters() async throws {
+        let receipt = try AppReceiptVerifierTests.receiptCreator.signReceipt(AppReceiptVerifierTests.receiptPayload("ProductionSandbox", AppReceiptVerifierTests.BUNDLE_ID, AppReceiptVerifierTests.RECEIPT_CREATION_DATE), digestAlgorithmParameters: false)
+
+        let decoded = try await validReceipt(AppReceiptVerifierTests.verifier(environment: .sandbox).verifyAndDecodeAppReceipt(encodedReceipt: encode(receipt)))
+        XCTAssertEqual(AppReceiptVerifierTests.BUNDLE_ID, decoded.bundleId)
+    }
+
     private static func verifier(_ creator: ReceiptCreator = receiptCreator, environment: AppStoreEnvironment, bundleId: String = BUNDLE_ID, enableOnlineChecks: Bool = false) -> AppReceiptVerifier {
         return try! AppReceiptVerifier(rootCertificates: [creator.rootCertificate], bundleId: bundleId, environment: environment, enableOnlineChecks: enableOnlineChecks)
     }
@@ -362,6 +702,15 @@ final class AppReceiptVerifierTests: XCTestCase {
             .raw(9999, UNKNOWN_RECEIPT_ATTRIBUTE_VALUE)
             .raw(17, consumablePurchase())
             .raw(17, subscriptionPurchase())
+            .build()
+    }
+
+    private static func receiptWithPurchase(_ inAppPurchase: [UInt8]) -> [UInt8] {
+        return ReceiptCreator.attributeSet()
+            .string(0, "ProductionSandbox")
+            .string(2, BUNDLE_ID)
+            .date(12, RECEIPT_CREATION_DATE)
+            .raw(17, inAppPurchase)
             .build()
     }
 

@@ -14,17 +14,29 @@ public final class ReceiptCreator: Sendable {
     private static let WWDR_INTERMEDIATE_OID: ASN1ObjectIdentifier = [1, 2, 840, 113635, 100, 6, 2, 1]
     private static let RECEIPT_SIGNER_OID: ASN1ObjectIdentifier = [1, 2, 840, 113635, 100, 6, 11, 1]
 
+    ///The common names of the chain, so a test can aim a certificate at the step of chain assembly it wants to reach.
+    public static let INTERMEDIATE_NAME = "Test WWDR CA"
+    public static let ROOT_NAME = "Test App Store Root CA"
+
     private static let SIGNED_DATA_OID: ASN1ObjectIdentifier = [1, 2, 840, 113549, 1, 7, 2]
     private static let DATA_OID: ASN1ObjectIdentifier = [1, 2, 840, 113549, 1, 7, 1]
     private static let CONTENT_TYPE_ATTRIBUTE_OID: ASN1ObjectIdentifier = [1, 2, 840, 113549, 1, 9, 3]
     private static let MESSAGE_DIGEST_ATTRIBUTE_OID: ASN1ObjectIdentifier = [1, 2, 840, 113549, 1, 9, 4]
     private static let SIGNING_TIME_ATTRIBUTE_OID: ASN1ObjectIdentifier = [1, 2, 840, 113549, 1, 9, 5]
-    private static let SHA256_OID: ASN1ObjectIdentifier = [2, 16, 840, 1, 101, 3, 4, 2, 1]
+    public static let SHA1_OID: ASN1ObjectIdentifier = [1, 3, 14, 3, 2, 26]
+    public static let SHA256_OID: ASN1ObjectIdentifier = [2, 16, 840, 1, 101, 3, 4, 2, 1]
+    private static let UNKNOWN_ATTRIBUTE_OID: ASN1ObjectIdentifier = [1, 3, 6, 1, 4, 1, 99999, 1]
     private static let RSA_ENCRYPTION_OID: ASN1ObjectIdentifier = [1, 2, 840, 113549, 1, 1, 1]
 
     private static let CONTEXT_TAG_0 = ASN1Identifier(tagWithNumber: 0, tagClass: .contextSpecific)
 
     private static let DAY: TimeInterval = 86400
+
+    ///A well-formed ASN.1 SEQUENCE that is not a certificate, for a container carrying an undecodable one.
+    private static let MALFORMED_CERTIFICATE: [UInt8] = [0x30, 0x03, 0x02, 0x01, 0x01]
+
+    ///Signature bytes for a container that is rejected before any signature is checked.
+    private static let UNCHECKED_SIGNATURE: [UInt8] = [UInt8](repeating: 0, count: 16)
 
     ///Leaf first, then intermediate, then root; a self-signed creator holds one entry.
     private let chain: [Certificate]
@@ -40,17 +52,19 @@ public final class ReceiptCreator: Sendable {
     ///
     ///- Parameter receiptSignerOid: Whether the leaf carries the receipt-signing marker OID
     ///- Parameter wwdrIntermediateOid: Whether the intermediate carries the WWDR marker OID
+    ///- Parameter ocspResponderUri: The OCSP responder the leaf names, which only a verifier with online checks
+    ///enabled ever queries
     ///- Parameter notBefore: The start of the validity window of every certificate in the chain
     ///- Parameter notAfter: The end of the validity window of every certificate in the chain
-    public static func createReceiptCreator(receiptSignerOid: Bool = true, wwdrIntermediateOid: Bool = true, notBefore: Date = daysAgo(3650), notAfter: Date = inOneYear()) throws -> ReceiptCreator {
+    public static func createReceiptCreator(receiptSignerOid: Bool = true, wwdrIntermediateOid: Bool = true, ocspResponderUri: String? = nil, notBefore: Date = daysAgo(3650), notAfter: Date = inOneYear()) throws -> ReceiptCreator {
         let rootKey = try rsaKey()
         let intermediateKey = try rsaKey()
         let leafKey = try rsaKey()
-        let rootName = distinguishedName("Test App Store Root CA")
-        let intermediateName = distinguishedName("Test WWDR CA")
+        let rootName = distinguishedName(ROOT_NAME)
+        let intermediateName = distinguishedName(INTERMEDIATE_NAME)
         let root = try certificate(subject: rootName, subjectKey: rootKey, issuer: rootName, issuerKey: rootKey, certificateAuthority: true, markerOid: nil, notBefore: notBefore, notAfter: notAfter)
         let intermediate = try certificate(subject: intermediateName, subjectKey: intermediateKey, issuer: rootName, issuerKey: rootKey, certificateAuthority: true, markerOid: wwdrIntermediateOid ? WWDR_INTERMEDIATE_OID : nil, notBefore: notBefore, notAfter: notAfter)
-        let leaf = try certificate(subject: distinguishedName("Test Receipt Signing"), subjectKey: leafKey, issuer: intermediateName, issuerKey: intermediateKey, certificateAuthority: false, markerOid: receiptSignerOid ? RECEIPT_SIGNER_OID : nil, notBefore: notBefore, notAfter: notAfter)
+        let leaf = try certificate(subject: distinguishedName("Test Receipt Signing"), subjectKey: leafKey, issuer: intermediateName, issuerKey: intermediateKey, certificateAuthority: false, markerOid: receiptSignerOid ? RECEIPT_SIGNER_OID : nil, ocspResponderUri: ocspResponderUri, notBefore: notBefore, notAfter: notAfter)
         return ReceiptCreator(chain: [leaf, intermediate, root], signingKey: leafKey)
     }
 
@@ -81,9 +95,32 @@ public final class ReceiptCreator: Sendable {
     ///BER shape genuine App Store receipts arrive in, rather than a single primitive one
     ///- Parameter paddingCertificates: Unrelated certificates embedded on top of the chain, as a receipt bloated to
     ///make chain assembly expensive carries
-    public func signReceipt(_ payload: [UInt8], embeddedCertificates: Int? = nil, signingTime: Date = Date(), signedAttributes: Bool = true, segmentedContent: Bool = false, paddingCertificates: Int = 0) throws -> Data {
-        let signedAttributeBytes = signedAttributes ? try ReceiptCreator.signedAttributeSet(payload: payload, signingTime: signingTime) : nil
-        let signature = try signingKey.signature(for: SHA256.hash(data: signedAttributeBytes ?? payload), padding: .insecurePKCS1v1_5)
+    ///- Parameter paddingSubject: The name the padding certificates are issued to and by, which decides the step of
+    ///chain assembly they become candidates at
+    ///- Parameter paddingBeforeChain: Whether the padding certificates are embedded ahead of the chain, so that the
+    ///first certificate in the container is not the one the signer info identifies
+    ///- Parameter digestAlgorithm: The digest algorithm the container declares, which also selects the digest the
+    ///signature is made over, as legacy App Store receipts are SHA-1 signed
+    ///- Parameter messageDigest: Whether the signed attributes carry the message digest attribute that binds them to
+    ///the payload
+    ///- Parameter unknownSignedAttribute: Whether to sign an additional attribute this library does not model, which
+    ///sorts after the message digest in the DER SET OF
+    ///- Parameter signedByAnotherKey: Whether to sign with a key unrelated to the leaf certificate, leaving the chain
+    ///and the message digest intact and only the signature wrong
+    ///- Parameter malformedCertificate: Whether to embed a node that does not decode as a certificate
+    ///- Parameter digestAlgorithmParameters: Whether the digest algorithm identifiers carry the DER NULL
+    ///parameters RFC 5754 lets a SHA-2 producer leave out
+    ///- Parameter encapsulatedPayloads: How many copies of the payload the `[0] EXPLICIT` content wrapper holds;
+    ///it holds exactly one, and a verifier that took the first of several would accept a receipt carrying one the
+    ///signature does not cover
+    ///- Parameter omitCertificates: Whether to leave out the optional certificates field, which CMS allows and
+    ///which leaves nothing in the container to identify the signer with
+    public func signReceipt(_ payload: [UInt8], embeddedCertificates: Int? = nil, signingTime: Date = Date(), signedAttributes: Bool = true, segmentedContent: Bool = false, paddingCertificates: Int = 0, paddingSubject: String = ReceiptCreator.INTERMEDIATE_NAME, paddingBeforeChain: Bool = false, digestAlgorithm: ASN1ObjectIdentifier = ReceiptCreator.SHA256_OID, messageDigest: Bool = true, unknownSignedAttribute: Bool = false, signedByAnotherKey: Bool = false, malformedCertificate: Bool = false, digestAlgorithmParameters: Bool = true, encapsulatedPayloads: Int = 1, omitCertificates: Bool = false) throws -> Data {
+        let signedAttributeBytes = signedAttributes ? try ReceiptCreator.signedAttributeSet(payload: payload, signingTime: signingTime, digestAlgorithm: digestAlgorithm, messageDigest: messageDigest, unknownSignedAttribute: unknownSignedAttribute) : nil
+        let signature = try ReceiptCreator.sign(signedAttributeBytes ?? payload, with: signedByAnotherKey ? ReceiptCreator.rsaKey() : signingKey, digestAlgorithm: digestAlgorithm)
+        let embeddedChain = Array(chain.prefix(embeddedCertificates ?? chain.count))
+        let padding = try (0..<paddingCertificates).map { _ in try ReceiptCreator.paddingCertificate(paddingSubject) }
+        let embeddedCertificateList = paddingBeforeChain ? padding + embeddedChain : embeddedChain + padding
 
         var serializer = DER.Serializer()
         try serializer.appendConstructedNode(identifier: .sequence) { coder in
@@ -91,31 +128,35 @@ public final class ReceiptCreator: Sendable {
             try coder.appendConstructedNode(identifier: ReceiptCreator.CONTEXT_TAG_0) { coder in
                 try coder.appendConstructedNode(identifier: .sequence) { coder in
                     try coder.serialize(1)
-                    try coder.serializeSetOf([ReceiptCreator.algorithmIdentifier(ReceiptCreator.SHA256_OID)])
+                    try coder.serializeSetOf([ReceiptCreator.algorithmIdentifier(digestAlgorithm, parameters: digestAlgorithmParameters)])
                     // encapContentInfo ::= SEQUENCE { eContentType OBJECT IDENTIFIER, eContent [0] EXPLICIT OCTET STRING }
                     try coder.appendConstructedNode(identifier: .sequence) { coder in
                         try coder.serialize(ReceiptCreator.DATA_OID)
                         try coder.appendConstructedNode(identifier: ReceiptCreator.CONTEXT_TAG_0) { coder in
-                            if segmentedContent {
-                                let split = payload.count / 2
-                                try coder.appendConstructedNode(identifier: .octetString) { coder in
-                                    try coder.serialize(ASN1OctetString(contentBytes: payload[..<split]))
-                                    try coder.serialize(ASN1OctetString(contentBytes: payload[split...]))
+                            for _ in 0..<encapsulatedPayloads {
+                                if segmentedContent {
+                                    let split = payload.count / 2
+                                    try coder.appendConstructedNode(identifier: .octetString) { coder in
+                                        try coder.serialize(ASN1OctetString(contentBytes: payload[..<split]))
+                                        try coder.serialize(ASN1OctetString(contentBytes: payload[split...]))
+                                    }
+                                } else {
+                                    try coder.serialize(ASN1OctetString(contentBytes: payload[...]))
                                 }
-                            } else {
-                                try coder.serialize(ASN1OctetString(contentBytes: payload[...]))
                             }
                         }
                     }
-                    coder.appendConstructedNode(identifier: ReceiptCreator.CONTEXT_TAG_0) { coder in
-                        for certificate in chain.prefix(embeddedCertificates ?? chain.count) {
-                            try! coder.serialize(certificate)
-                        }
-                        for index in 0..<paddingCertificates {
-                            try! coder.serialize(try! ReceiptCreator.paddingCertificate(index))
+                    if !omitCertificates {
+                        coder.appendConstructedNode(identifier: ReceiptCreator.CONTEXT_TAG_0) { coder in
+                            for certificate in embeddedCertificateList {
+                                try! coder.serialize(certificate)
+                            }
+                            if malformedCertificate {
+                                coder.serializeRawBytes(ReceiptCreator.MALFORMED_CERTIFICATE)
+                            }
                         }
                     }
-                    try coder.serializeSetOf([try signerInfo(signedAttributeBytes: signedAttributeBytes, signature: signature)])
+                    try coder.serializeSetOf([try signerInfo(signedAttributeBytes: signedAttributeBytes, signature: signature, digestAlgorithm: digestAlgorithm, digestAlgorithmParameters: digestAlgorithmParameters)])
                 }
             }
         }
@@ -156,6 +197,14 @@ public final class ReceiptCreator: Sendable {
             return raw(type, serializer.serializedBytes)
         }
 
+        ///An attribute whose value is a DER PrintableString, one of the string types Apple uses interchangeably.
+        @discardableResult
+        public func printableString(_ type: Int64, _ value: String) -> AttributeSet {
+            var serializer = DER.Serializer()
+            try! serializer.serialize(try! ASN1PrintableString(value))
+            return raw(type, serializer.serializedBytes)
+        }
+
         ///An attribute whose value is a DER INTEGER, e.g. a purchase quantity.
         @discardableResult
         public func integer(_ type: Int64, _ value: Int64) -> AttributeSet {
@@ -177,11 +226,102 @@ public final class ReceiptCreator: Sendable {
             return self
         }
 
+        ///An attribute carrying a fourth element beyond the three this library reads, as a receipt from a later
+        ///App Store version would.
+        @discardableResult
+        public func rawWithExtraElement(_ type: Int64, _ value: [UInt8]) -> AttributeSet {
+            var serializer = DER.Serializer()
+            try! serializer.appendConstructedNode(identifier: .sequence) { coder in
+                try coder.serialize(type)
+                try coder.serialize(1)
+                try coder.serialize(ASN1OctetString(contentBytes: value[...]))
+                try coder.serialize(1)
+            }
+            attributes.append(DERBytes(serializer.serializedBytes))
+            return self
+        }
+
         public func build() -> [UInt8] {
             var serializer = DER.Serializer()
             try! serializer.serializeSetOf(attributes)
             return serializer.serializedBytes
         }
+    }
+
+    ///Containers with a piece missing from each structure the verifier indexes into, paired with what each one
+    ///leaves out. None of them is signed: every one has to be rejected while the container is being read, and code
+    ///that indexed into one of these without first checking its length would trap rather than report a failure.
+    public static func truncatedContainers() -> [(String, Data)] {
+        return [
+            ("content info carrying no content", der { coder in
+                try coder.appendConstructedNode(identifier: .sequence) { coder in
+                    try coder.serialize(SIGNED_DATA_OID)
+                }
+            }),
+            ("encapsulated content info carrying no payload", signedDataContainer { coder in
+                try coder.serialize(1)
+                try coder.serializeSetOf([algorithmIdentifier(SHA256_OID)])
+                try coder.appendConstructedNode(identifier: .sequence) { coder in
+                    try coder.serialize(DATA_OID)
+                }
+                coder.appendConstructedNode(identifier: .set) { _ in }
+            }),
+            ("signer identifier carrying no serial number", signedDataContainer { coder in
+                try signedDataPrefix(&coder)
+                try signerInfos(&coder) { coder in
+                    try coder.serialize(1)
+                    try coder.appendConstructedNode(identifier: .sequence) { coder in
+                        try coder.serialize(distinguishedName(INTERMEDIATE_NAME))
+                    }
+                    try coder.serialize(algorithmIdentifier(SHA256_OID))
+                    try coder.serialize(algorithmIdentifier(RSA_ENCRYPTION_OID))
+                    try coder.serialize(ASN1OctetString(contentBytes: UNCHECKED_SIGNATURE[...]))
+                }
+            }),
+            ("digest algorithm identifier carrying no algorithm", signedDataContainer { coder in
+                try signedDataPrefix(&coder)
+                try signerInfos(&coder) { coder in
+                    try coder.serialize(1)
+                    try signerIdentifier(&coder)
+                    coder.appendConstructedNode(identifier: .sequence) { _ in }
+                    try coder.serialize(algorithmIdentifier(RSA_ENCRYPTION_OID))
+                    try coder.serialize(ASN1OctetString(contentBytes: UNCHECKED_SIGNATURE[...]))
+                }
+            }),
+            ("signed attribute carrying no value", signedDataContainer { coder in
+                try signedDataPrefix(&coder)
+                try signerInfos(&coder) { coder in
+                    try coder.serialize(1)
+                    try signerIdentifier(&coder)
+                    try coder.serialize(algorithmIdentifier(SHA256_OID))
+                    try coder.appendConstructedNode(identifier: CONTEXT_TAG_0) { coder in
+                        // The message digest attribute, the one attribute whose value is read
+                        try coder.appendConstructedNode(identifier: .sequence) { coder in
+                            try coder.serialize(MESSAGE_DIGEST_ATTRIBUTE_OID)
+                        }
+                    }
+                    try coder.serialize(algorithmIdentifier(RSA_ENCRYPTION_OID))
+                    try coder.serialize(ASN1OctetString(contentBytes: UNCHECKED_SIGNATURE[...]))
+                }
+            }),
+            ("signer info carrying no signature", signedDataContainer { coder in
+                try signedDataPrefix(&coder)
+                try signerInfos(&coder) { coder in
+                    try coder.serialize(1)
+                    try signerIdentifier(&coder)
+                    try coder.serialize(algorithmIdentifier(SHA256_OID))
+                    try coder.appendConstructedNode(identifier: CONTEXT_TAG_0) { coder in
+                        try coder.appendConstructedNode(identifier: .sequence) { coder in
+                            try coder.serialize(CONTENT_TYPE_ATTRIBUTE_OID)
+                            try coder.appendConstructedNode(identifier: .set) { coder in
+                                try coder.serialize(DATA_OID)
+                            }
+                        }
+                    }
+                    try coder.serialize(algorithmIdentifier(RSA_ENCRYPTION_OID))
+                }
+            })
+        ]
     }
 
     public static func inOneYear() -> Date {
@@ -194,7 +334,7 @@ public final class ReceiptCreator: Sendable {
 
     ///`SignerInfo ::= SEQUENCE { version INTEGER, sid IssuerAndSerialNumber, digestAlgorithm AlgorithmIdentifier,`
     ///`signedAttrs [0] IMPLICIT SignedAttributes OPTIONAL, signatureAlgorithm AlgorithmIdentifier, signature OCTET STRING }`
-    private func signerInfo(signedAttributeBytes: [UInt8]?, signature: _RSA.Signing.RSASignature) throws -> DERBytes {
+    private func signerInfo(signedAttributeBytes: [UInt8]?, signature: _RSA.Signing.RSASignature, digestAlgorithm: ASN1ObjectIdentifier, digestAlgorithmParameters: Bool) throws -> DERBytes {
         let leaf = chain[0]
         var serializer = DER.Serializer()
         try serializer.appendConstructedNode(identifier: .sequence) { coder in
@@ -203,7 +343,7 @@ public final class ReceiptCreator: Sendable {
                 try coder.serialize(leaf.issuer)
                 try coder.serialize(leaf.serialNumber.bytes)
             }
-            try coder.serialize(ReceiptCreator.algorithmIdentifier(ReceiptCreator.SHA256_OID))
+            try coder.serialize(ReceiptCreator.algorithmIdentifier(digestAlgorithm, parameters: digestAlgorithmParameters))
             if var implicitlyTagged = signedAttributeBytes {
                 // The same bytes that were signed, with the SET OF tag swapped back for the IMPLICIT [0] tag
                 implicitlyTagged[0] = 0xA0
@@ -216,19 +356,88 @@ public final class ReceiptCreator: Sendable {
     }
 
     ///The signed attributes, serialized as the explicit SET OF the signature is computed over.
-    private static func signedAttributeSet(payload: [UInt8], signingTime: Date) throws -> [UInt8] {
-        let contentType = try attribute(CONTENT_TYPE_ATTRIBUTE_OID) { coder in
-            try coder.serialize(DATA_OID)
+    private static func signedAttributeSet(payload: [UInt8], signingTime: Date, digestAlgorithm: ASN1ObjectIdentifier, messageDigest: Bool, unknownSignedAttribute: Bool) throws -> [UInt8] {
+        var attributes = [
+            try attribute(CONTENT_TYPE_ATTRIBUTE_OID) { coder in
+                try coder.serialize(DATA_OID)
+            },
+            try attribute(SIGNING_TIME_ATTRIBUTE_OID) { coder in
+                try coder.serialize(utcTime(signingTime))
+            }
+        ]
+        if messageDigest {
+            attributes.append(try attribute(MESSAGE_DIGEST_ATTRIBUTE_OID) { coder in
+                try coder.serialize(ASN1OctetString(contentBytes: ArraySlice(digest(payload, digestAlgorithm: digestAlgorithm))))
+            })
         }
-        let messageDigest = try attribute(MESSAGE_DIGEST_ATTRIBUTE_OID) { coder in
-            try coder.serialize(ASN1OctetString(contentBytes: ArraySlice(Array(SHA256.hash(data: payload)))))
-        }
-        let signingTimeAttribute = try attribute(SIGNING_TIME_ATTRIBUTE_OID) { coder in
-            try coder.serialize(utcTime(signingTime))
+        if unknownSignedAttribute {
+            attributes.append(try attribute(UNKNOWN_ATTRIBUTE_OID) { coder in
+                try coder.serialize(ASN1OctetString(contentBytes: ArraySlice([UInt8](repeating: 0, count: 64))))
+            })
         }
         var serializer = DER.Serializer()
-        try serializer.serializeSetOf([contentType, messageDigest, signingTimeAttribute])
+        try serializer.serializeSetOf(attributes)
         return serializer.serializedBytes
+    }
+
+    ///`ContentInfo ::= SEQUENCE { contentType OBJECT IDENTIFIER, content [0] EXPLICIT SignedData }`, with the
+    ///fields of the `SignedData` written by the caller.
+    private static func signedDataContainer(_ signedDataFields: (inout DER.Serializer) throws -> Void) -> Data {
+        return der { coder in
+            try coder.appendConstructedNode(identifier: .sequence) { coder in
+                try coder.serialize(SIGNED_DATA_OID)
+                try coder.appendConstructedNode(identifier: CONTEXT_TAG_0) { coder in
+                    try coder.appendConstructedNode(identifier: .sequence) { coder in
+                        try signedDataFields(&coder)
+                    }
+                }
+            }
+        }
+    }
+
+    ///The version, digest algorithms and encapsulated content info a `SignedData` carries before its signer infos.
+    private static func signedDataPrefix(_ coder: inout DER.Serializer) throws {
+        try coder.serialize(1)
+        try coder.serializeSetOf([algorithmIdentifier(SHA256_OID)])
+        try coder.appendConstructedNode(identifier: .sequence) { coder in
+            try coder.serialize(DATA_OID)
+            try coder.appendConstructedNode(identifier: CONTEXT_TAG_0) { coder in
+                try coder.serialize(ASN1OctetString(contentBytes: []))
+            }
+        }
+    }
+
+    ///`signerInfos SET OF SignerInfo` holding the one signer info written by the caller.
+    private static func signerInfos(_ coder: inout DER.Serializer, _ signerFields: (inout DER.Serializer) throws -> Void) throws {
+        try coder.appendConstructedNode(identifier: .set) { coder in
+            try coder.appendConstructedNode(identifier: .sequence) { coder in
+                try signerFields(&coder)
+            }
+        }
+    }
+
+    ///`sid ::= IssuerAndSerialNumber SEQUENCE { issuer Name, serialNumber INTEGER }`
+    private static func signerIdentifier(_ coder: inout DER.Serializer) throws {
+        try coder.appendConstructedNode(identifier: .sequence) { coder in
+            try coder.serialize(distinguishedName(INTERMEDIATE_NAME))
+            try coder.serialize(1)
+        }
+    }
+
+    private static func der(_ build: (inout DER.Serializer) throws -> Void) -> Data {
+        var serializer = DER.Serializer()
+        try! build(&serializer)
+        return Data(serializer.serializedBytes)
+    }
+
+    private static func digest(_ bytes: [UInt8], digestAlgorithm: ASN1ObjectIdentifier) -> [UInt8] {
+        return digestAlgorithm == SHA1_OID ? Array(Insecure.SHA1.hash(data: bytes)) : Array(SHA256.hash(data: bytes))
+    }
+
+    private static func sign(_ bytes: [UInt8], with key: _RSA.Signing.PrivateKey, digestAlgorithm: ASN1ObjectIdentifier) throws -> _RSA.Signing.RSASignature {
+        return digestAlgorithm == SHA1_OID
+            ? try key.signature(for: Insecure.SHA1.hash(data: bytes), padding: .insecurePKCS1v1_5)
+            : try key.signature(for: SHA256.hash(data: bytes), padding: .insecurePKCS1v1_5)
     }
 
     ///`Attribute ::= SEQUENCE { attrType OBJECT IDENTIFIER, attrValues SET OF ANY }`
@@ -243,11 +452,13 @@ public final class ReceiptCreator: Sendable {
         return DERBytes(serializer.serializedBytes)
     }
 
-    private static func algorithmIdentifier(_ oid: ASN1ObjectIdentifier) -> DERBytes {
+    private static func algorithmIdentifier(_ oid: ASN1ObjectIdentifier, parameters: Bool = true) -> DERBytes {
         var serializer = DER.Serializer()
         try! serializer.appendConstructedNode(identifier: .sequence) { coder in
             try coder.serialize(oid)
-            try coder.serialize(ASN1Null())
+            if parameters {
+                try coder.serialize(ASN1Null())
+            }
         }
         return DERBytes(serializer.serializedBytes)
     }
@@ -263,11 +474,11 @@ public final class ReceiptCreator: Sendable {
         return try _RSA.Signing.PrivateKey(keySize: .bits2048)
     }
 
-    ///A self-signed certificate carrying the WWDR subject name, so that it is a candidate at every step of chain
-    ///assembly rather than being skipped after one comparison.
-    private static func paddingCertificate(_ index: Int) throws -> Certificate {
+    ///A self-signed certificate carrying `subject` as both its subject and its issuer, so that it is a candidate at
+    ///the step of chain assembly that looks for that name rather than being skipped after one comparison.
+    private static func paddingCertificate(_ subject: String) throws -> Certificate {
         let key = try rsaKey()
-        return try certificate(subject: distinguishedName("Test WWDR CA"), subjectKey: key, issuer: distinguishedName("Test WWDR CA"), issuerKey: key, certificateAuthority: true, markerOid: nil, notBefore: daysAgo(3650), notAfter: inOneYear())
+        return try certificate(subject: distinguishedName(subject), subjectKey: key, issuer: distinguishedName(subject), issuerKey: key, certificateAuthority: true, markerOid: nil, notBefore: daysAgo(3650), notAfter: inOneYear())
     }
 
     private static func distinguishedName(_ commonName: String) -> DistinguishedName {
@@ -276,13 +487,18 @@ public final class ReceiptCreator: Sendable {
         }
     }
 
-    private static func certificate(subject: DistinguishedName, subjectKey: _RSA.Signing.PrivateKey, issuer: DistinguishedName, issuerKey: _RSA.Signing.PrivateKey, certificateAuthority: Bool, markerOid: ASN1ObjectIdentifier?, notBefore: Date, notAfter: Date) throws -> Certificate {
+    private static func certificate(subject: DistinguishedName, subjectKey: _RSA.Signing.PrivateKey, issuer: DistinguishedName, issuerKey: _RSA.Signing.PrivateKey, certificateAuthority: Bool, markerOid: ASN1ObjectIdentifier?, ocspResponderUri: String? = nil, notBefore: Date, notAfter: Date) throws -> Certificate {
         var extensions = [
             try Certificate.Extension(certificateAuthority ? BasicConstraints.isCertificateAuthority(maxPathLength: nil) : BasicConstraints.notCertificateAuthority, critical: true)
         ]
         if let markerOid {
             // The Apple marker extensions are non-critical and carry a DER NULL as their value
             extensions.append(Certificate.Extension(oid: markerOid, critical: false, value: [0x05, 0x00]))
+        }
+        if let ocspResponderUri {
+            extensions.append(try Certificate.Extension(AuthorityInformationAccess([
+                AuthorityInformationAccess.AccessDescription(method: .ocspServer, location: .uniformResourceIdentifier(ocspResponderUri))
+            ]), critical: false))
         }
         return try Certificate(
             version: .v3,
