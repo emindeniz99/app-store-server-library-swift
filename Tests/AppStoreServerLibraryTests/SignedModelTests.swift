@@ -134,6 +134,9 @@ final class SignedModelTests: XCTestCase {
         XCTAssertEqual(1698148950000, notification.externalPurchaseToken!.tokenCreationDate)
         XCTAssertEqual(55555, notification.externalPurchaseToken!.appAppleId)
         XCTAssertEqual("com.example", notification.externalPurchaseToken!.bundleId)
+        XCTAssertEqual(TokenType.acquisition, notification.externalPurchaseToken!.tokenType)
+        XCTAssertEqual("ACQUISITION", notification.externalPurchaseToken!.rawTokenType)
+        XCTAssertEqual(Date(timeIntervalSince1970: 1698149000), notification.externalPurchaseToken!.tokenExpirationDate)
         TestingUtility.confirmCodableInternallyConsistent(notification)
     }
     
@@ -166,6 +169,9 @@ final class SignedModelTests: XCTestCase {
         XCTAssertEqual(1698148950000, notification.externalPurchaseToken!.tokenCreationDate)
         XCTAssertEqual(55555, notification.externalPurchaseToken!.appAppleId)
         XCTAssertEqual("com.example", notification.externalPurchaseToken!.bundleId)
+        XCTAssertEqual(TokenType.acquisition, notification.externalPurchaseToken!.tokenType)
+        XCTAssertEqual("ACQUISITION", notification.externalPurchaseToken!.rawTokenType)
+        XCTAssertEqual(Date(timeIntervalSince1970: 1698149000), notification.externalPurchaseToken!.tokenExpirationDate)
         TestingUtility.confirmCodableInternallyConsistent(notification)
     }
     
@@ -252,6 +258,26 @@ final class SignedModelTests: XCTestCase {
         XCTAssertEqual(119880, txnCommitment.commitmentPrice)
         XCTAssertEqual(12, txnCommitment.totalBillingPeriods)
         TestingUtility.confirmCodableInternallyConsistent(transaction)
+    }
+
+    ///The payload of a JWS is always UTF-8 encoded, so decoding it must not depend on the default charset of the platform.
+    ///The expected values below are written as escape sequences so that this test does not depend on the encoding
+    ///used to compile it either.
+    public func testNonAsciiDataDecodingIsIndependentOfTheDefaultCharset() async throws {
+        let signedTransaction = TestingUtility.createSignedDataFromJson("resources/models/signedTransactionWithNonAsciiData.json")
+
+        let verifiedTransaction = await TestingUtility.getSignedDataVerifier().verifyAndDecodeTransaction(signedTransaction: signedTransaction)
+
+        guard case .valid(let transaction) = verifiedTransaction else {
+            XCTAssertTrue(false)
+            return
+        }
+
+        let advancedCommerceInfo = transaction.advancedCommerceInfo!
+        XCTAssertEqual("Abonnement Caf\u{00e9} \u{2014} 5,99 \u{20ac} par mois", advancedCommerceInfo.descriptors!.description)
+        XCTAssertEqual("Caf\u{00e9} Premium", advancedCommerceInfo.descriptors!.displayName)
+        XCTAssertEqual("\u{30d7}\u{30ec}\u{30df}\u{30a2}\u{30e0}\u{6a5f}\u{80fd}", advancedCommerceInfo.items![0].description)
+        XCTAssertEqual("\u{30d7}\u{30ec}\u{30df}\u{30a2}\u{30e0}", advancedCommerceInfo.items![0].displayName)
     }
 
     public func testTransactionWithRevocationDecoding() async throws {
